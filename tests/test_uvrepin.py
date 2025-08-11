@@ -47,7 +47,7 @@ class TestGatherDirect:
                 ]
             }
         }
-        result = gather_direct(data)
+        result, is_optional = gather_direct(data)
         assert None in result
         assert len(result[None]) == 2
         assert result[None][0]["name"] == "requests"
@@ -60,11 +60,52 @@ class TestGatherDirect:
                 "test": ["coverage==7.2.0"]
             }
         }
-        result = gather_direct(data)
+        result, is_optional = gather_direct(data)
         assert "dev" in result
         assert "test" in result
         assert len(result["dev"]) == 2
         assert len(result["test"]) == 1
+        assert is_optional["dev"] == False
+        assert is_optional["test"] == False
+
+    def test_gather_optional_dependencies(self):
+        data = {
+            "project": {
+                "optional-dependencies": {
+                    "dev": ["pytest==7.4.0", "black==23.7.0"],
+                    "docs": ["sphinx==5.0.0"]
+                }
+            }
+        }
+        result, is_optional = gather_direct(data)
+        assert "dev" in result
+        assert "docs" in result
+        assert len(result["dev"]) == 2
+        assert len(result["docs"]) == 1
+        assert is_optional["dev"] == True
+        assert is_optional["docs"] == True
+
+    def test_gather_mixed_dependencies(self):
+        data = {
+            "project": {
+                "dependencies": ["requests==2.28.1"],
+                "optional-dependencies": {
+                    "dev": ["pytest==7.4.0"]
+                }
+            },
+            "dependency-groups": {
+                "test": ["coverage==7.2.0"]
+            }
+        }
+        result, is_optional = gather_direct(data)
+        assert None in result
+        assert "dev" in result
+        assert "test" in result
+        assert len(result[None]) == 1
+        assert len(result["dev"]) == 1
+        assert len(result["test"]) == 1
+        assert is_optional["dev"] == True
+        assert is_optional["test"] == False
 
 
 class TestParseOutdatedTable:
@@ -235,6 +276,79 @@ pytest     7.3.0      7.4.0      wheel"""
                     main()
             
             assert exc_info.value.code == 1
+
+    def test_optional_dependencies_dry_run(self, tmp_path, capsys):
+        """Test dry run with optional dependencies"""
+        pyproject_content = """[project]
+name = "test-project"
+dependencies = [
+    "requests==2.28.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.3.0",
+    "black==23.6.0"
+]
+"""
+        pyproject_path = tmp_path / "pyproject.toml"
+        pyproject_path.write_text(pyproject_content)
+        
+        mock_outdated_output = """Package    Version    Latest     Type
+--------   -------    ------     ----
+pytest     7.3.0      7.4.0      wheel"""
+
+        with patch('uvrepin.main.subprocess.run') as mock_run, \
+             patch('uvrepin.main.PYPROJECT', tmp_path / "pyproject.toml"):
+            
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # uv --version
+                MagicMock(returncode=0, stdout=mock_outdated_output)  # uv pip list --outdated
+            ]
+            
+            with patch('sys.argv', ['uvrepin', '--dry-run']):
+                exit_code = main()
+                
+            assert exit_code == 0
+            captured = capsys.readouterr()
+            assert "pytest" in captured.out
+            assert "dev" in captured.out
+
+    def test_optional_dependencies_update(self, tmp_path):
+        """Test updating optional dependencies"""
+        pyproject_content = """[project]
+name = "test-project"
+dependencies = [
+    "requests==2.28.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.3.0"
+]
+"""
+        pyproject_path = tmp_path / "pyproject.toml"
+        pyproject_path.write_text(pyproject_content)
+        
+        mock_outdated_output = """Package    Version    Latest     Type
+--------   -------    ------     ----
+pytest     7.3.0      7.4.0      wheel"""
+
+        with patch('uvrepin.main.subprocess.run') as mock_run, \
+             patch('uvrepin.main.PYPROJECT', tmp_path / "pyproject.toml"):
+            
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # uv --version
+                MagicMock(returncode=0, stdout=mock_outdated_output),  # uv pip list --outdated
+                MagicMock(returncode=0)  # uv add --optional dev pytest==7.4.0
+            ]
+            
+            with patch('sys.argv', ['uvrepin']):
+                exit_code = main()
+                
+            assert exit_code == 0
+            # Verify uv add was called with --optional flag
+            mock_run.assert_any_call(['uv', 'add', '--no-sync', '--optional', 'dev', 'pytest==7.4.0'])
 
 
 class TestCLIIntegration:

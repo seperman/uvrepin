@@ -55,8 +55,10 @@ def read_pyproject():
     if not PYPROJECT.exists(): die(f"Couldn't find {PYPROJECT.resolve()}")
     with PYPROJECT.open("rb") as f: return tomllib.load(f)
 
-def gather_direct(data: dict) -> dict[str|None, list[dict]]:
+def gather_direct(data: dict) -> tuple[dict[str|None, list[dict]], dict[str, bool]]:
+    """Return (groups_dict, is_optional_dict) where is_optional_dict tracks which groups are optional-dependencies."""
     out = {}
+    is_optional = {}
     proj = data.get("project", {})
     deps = proj.get("dependencies", []) or []
     if deps:
@@ -66,6 +68,22 @@ def gather_direct(data: dict) -> dict[str|None, list[dict]]:
             if p and p[0] != "SKIP":
                 name, extras, pinned, marker = p
                 out[None].append(dict(raw=r, name=name, extras=extras, pinned=pinned, marker=marker))
+    
+    # Handle project.optional-dependencies
+    optional_deps = proj.get("optional-dependencies", {}) or {}
+    for gname, arr in optional_deps.items():
+        if not isinstance(arr, list): continue
+        group = []
+        for r in arr:
+            p = parse_req(r)
+            if p and p[0] != "SKIP":
+                name, extras, pinned, marker = p
+                group.append(dict(raw=r, name=name, extras=extras, pinned=pinned, marker=marker))
+        if group:
+            out[gname] = group
+            is_optional[gname] = True
+    
+    # Handle dependency-groups (PEP 735)
     dep_groups = data.get("dependency-groups", {}) or {}
     for gname, arr in dep_groups.items():
         if not isinstance(arr, list): continue
@@ -75,8 +93,10 @@ def gather_direct(data: dict) -> dict[str|None, list[dict]]:
             if p and p[0] != "SKIP":
                 name, extras, pinned, marker = p
                 group.append(dict(raw=r, name=name, extras=extras, pinned=pinned, marker=marker))
-        if group: out[gname] = group
-    return out
+        if group:
+            out[gname] = group
+            is_optional[gname] = False
+    return out, is_optional
 
 def run(*args: str, capture=False, check=True):
     return subprocess.run(args, text=True, capture_output=capture, check=check)
@@ -104,10 +124,14 @@ def parse_outdated_table(text: str) -> dict[str, str]:
         latest[pep503(name)] = latest_ver
     return latest
 
-def build_uv_add_base(group: str|None, sync: bool, allow_pre: bool, indexes: list[str]) -> list[str]:
+def build_uv_add_base(group: str|None, sync: bool, allow_pre: bool, indexes: list[str], is_optional: bool = False) -> list[str]:
     args = ["uv", "add"]
     if not sync: args.append("--no-sync")
-    if group is not None: args += ["--group", group]
+    if group is not None:
+        if is_optional:
+            args += ["--optional", group]
+        else:
+            args += ["--group", group]
     if allow_pre: args += ["--prerelease", "always"]
     for idx in indexes: args += ["--index", idx]
     return args
@@ -123,7 +147,7 @@ def main():
 
     ensure_uv()
     data = read_pyproject()
-    groups = gather_direct(data)
+    groups, is_optional_map = gather_direct(data)
     if not groups:
         print("No direct dependencies found."); return 0
 
@@ -176,7 +200,8 @@ def main():
     for gname in list(groups.keys()):
         to_update = [(d, latest) for (g, d, latest) in plan if g == gname]
         if not to_update: continue
-        base = build_uv_add_base(gname, sync=args.sync, allow_pre=args.pre, indexes=args.index)
+        is_opt = is_optional_map.get(gname, False) if gname is not None else False
+        base = build_uv_add_base(gname, sync=args.sync, allow_pre=args.pre, indexes=args.index, is_optional=is_opt)
         reqs = []
         for d, latest in to_update:
             spec = d["name"] + d["extras"] + f"=={latest}"
