@@ -3,21 +3,25 @@ requires = ["flit_core >=2,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name =  "py-project-toml"
+name = "uvrepin"
 authors = [
     {name = "Sep Dehpour", email = "sep@zepworks.com"},
 ]
-description = "Repin pyproject.toml"
+description = "Repin all direct dependencies in pyproject.toml to latest exact versions using uv"
 readme = "README.md"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Software Distribution",
 ]
-requires-python = ">=3.8.1"
+requires-python = ">=3.11"
 dynamic = ["version"]
+dependencies = []
 
 [project.optional-dependencies]
 spark = [
@@ -41,13 +45,16 @@ test = [
     "pytest-github-actions-annotate-failures",
 ]
 
+[project.scripts]
+uvrepin = "uvrepin:main"
+
 [project.urls]
 Documentation = "https://github.com/seperman/uvrepin/tree/main#readme"
 Source = "https://github.com/seperman/uvrepin"
 Tracker = "https://github.com/seperman/uvrepin/issues"
 
 [tool.flit.module]
-name = "python_package"
+name = "uvrepin"
 
 [tool.bandit]
 exclude_dirs = ["build","dist","tests","scripts"]

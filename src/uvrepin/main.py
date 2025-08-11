@@ -190,6 +190,7 @@ def main():
     if rc == 0:
         print("\nDone. pyproject.toml updated{}."
               .format(" and environment synced" if args.sync else " (environment unchanged)"))
+        return 0
     else:
         die("One or more uv commands failed. See output above.", rc)
 
