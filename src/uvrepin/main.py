@@ -271,7 +271,7 @@ def align_workspace_members(resolution: ConflictResolution, sync: bool, indexes:
                 member_specs.append(spec)
         
         if member_specs:
-            cmd = ["uv", "add", "--project", member, "--no-sync", "--frozen", "--optional", resolution.extra_name] + member_specs
+            cmd = ["uv", "add", "--project", member, "--no-sync", "--optional", resolution.extra_name] + member_specs
             print("Running:", " ".join(shlex.quote(x) for x in cmd))
             try:
                 result = run(*cmd)
@@ -415,7 +415,7 @@ def main():
         cmd = base + reqs
         print("Running:", " ".join(shlex.quote(x) for x in cmd))
         try:
-            res = run(*cmd, capture=True)
+            res = run(*cmd, capture=True, check=False)
             rc = rc or res.returncode
             
             # Check for workspace conflicts on failure
