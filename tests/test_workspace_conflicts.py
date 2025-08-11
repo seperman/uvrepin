@@ -57,6 +57,24 @@ No solution found when resolving dependencies:
         # Should not match conflicts with different package names
         assert conflicts == []
 
+    def test_parse_workspace_conflict_new_uv_format(self):
+        stderr = """  × No solution found when resolving dependencies:
+  ╰─▶ Because common depends on pydantic==2.11.7 and qluster-sdk[dev] depends on
+      pydantic==2.11.5, we can conclude that common[dev] and qluster-sdk[dev] are
+      incompatible.
+      And because your workspace requires common[dev] and qluster-sdk[dev], we can
+      conclude that your workspace's requirements are unsatisfiable."""
+        
+        conflicts = parse_workspace_conflict(stderr)
+        
+        assert conflicts is not None
+        assert len(conflicts) == 1
+        
+        # Check the conflict
+        assert conflicts[0].package_name == "pydantic"
+        assert conflicts[0].extra_name == "dev"
+        assert conflicts[0].conflicts == {"common": "2.11.7", "qluster-sdk": "2.11.5"}
+
 
 class TestTargetVersionDetermination:
     def test_determine_target_versions_latest_policy(self):
@@ -606,3 +624,197 @@ No solution found when resolving dependencies:
                     main()
             
             assert exc_info.value.code == 1
+
+    def test_pydantic_conflict_scenario(self, tmp_path, capsys):
+        """Test the exact pydantic conflict scenario reported by user."""
+        workspace_root = tmp_path
+        
+        # Atlas workspace root pyproject.toml
+        root_pyproject = """[project]
+name = "atlas"
+version = "2.34.0"
+requires-python = ">=3.13"
+
+dependencies = [
+    "edgy",
+    "common",
+    "cfs", 
+    "cueue",
+    "capi",
+    "cettings",
+    "cmapper",
+    "cmigrator",
+    "scheduler",
+    "sensor",
+    "data-matrix",
+    "qluster-sdk",
+    "qluster-chemikal"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pydantic==2.11.5"
+]
+
+[tool.uv.sources]
+edgy = { workspace = true }
+common = { workspace = true }
+cfs = { workspace = true }
+cueue = { workspace = true }
+capi = { workspace = true }
+cettings = { workspace = true }
+cmapper = { workspace = true }
+cmigrator = { workspace = true }
+scheduler = { workspace = true }
+sensor = { workspace = true }
+data-matrix = { workspace = true }
+qluster-sdk = { workspace = true }
+qluster-chemikal = { path = "../qluster-chemikal", editable = true }
+
+[tool.uv.workspace]
+members = [
+  "edgy",
+  "common",
+  "cfs",
+  "cueue", 
+  "capi",
+  "cettings",
+  "cmapper",
+  "cmigrator",
+  "scheduler",
+  "sensor",
+  "data-matrix",
+  "qluster-sdk",
+]
+"""
+        (workspace_root / "pyproject.toml").write_text(root_pyproject)
+        
+        # Common member with pydantic 2.11.7
+        common_dir = tmp_path / "common"
+        common_dir.mkdir()
+        common_pyproject = """[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "common"
+version = "2.34.0"
+description = "Common functionalities."
+readme = "README.md"
+requires-python = ">=3.13"
+
+authors = [
+    {name = "Sep Dehpour", email = "sep@getqluster.com"},
+]
+
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development",
+    "Programming Language :: Python :: 3.13",
+    "Development Status :: 5 - Production/Stable",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==1.0.0",
+    "pytest_cov==6.1.1",
+    "flake8==7.2.0",
+    "ipdb==0.13.13",
+    "bump2version==1.0.1", 
+    "pytest-benchmark==5.1.0",
+    "ruff==0.12.2",
+    "pydantic==2.11.7",
+]
+"""
+        (common_dir / "pyproject.toml").write_text(common_pyproject)
+        
+        # Qluster SDK member with pydantic 2.11.5
+        sdk_dir = tmp_path / "qluster_sdk"
+        sdk_dir.mkdir()
+        sdk_pyproject = """[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qluster_sdk"
+version = "0.1.0"
+description = "qluster_sdk"
+authors = [
+    { name = "Qluster Engineering", email = "support@getqluster.com" },
+]
+
+readme = { file = "README.md", content-type = "markdown" }
+
+classifiers = [
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent", 
+  "Topic :: Software Development",
+  "Programming Language :: Python :: 3.13",
+  "Development Status :: 5 - Production/Stable",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pydantic==2.11.5",
+    "pytest==8.3.5",
+    "pytest-asyncio==1.0.0",
+    "pytest_cov==6.1.1",
+    "flake8==7.2.0",
+    "ipdb==0.13.13",
+]
+"""
+        (sdk_dir / "pyproject.toml").write_text(sdk_pyproject)
+        
+        # Mock uvrepin's core dependencies
+        mock_outdated_output = """Package      Version    Latest     Type
+--------     -------    ------     ----
+pydantic     2.11.5     2.11.7     wheel
+pytest       8.3.5      8.4.1      wheel
+flake8       7.2.0      7.3.0      wheel"""
+
+        # Mock the exact conflict stderr from user's report
+        conflict_stderr = """  × No solution found when resolving dependencies:
+  ╰─▶ Because common depends on pydantic==2.11.7 and qluster-sdk[dev] depends on
+      pydantic==2.11.5, we can conclude that common[dev] and qluster-sdk[dev] are
+      incompatible.
+      And because your workspace requires common[dev] and qluster-sdk[dev], we can
+      conclude that your workspace's requirements are unsatisfiable.
+  help: If you want to add the package regardless of the failed resolution, provide the
+        `--frozen` flag to skip locking and syncing."""
+
+        with patch.object(uv_runner, 'run') as mock_run, \
+             patch('uvrepin.main.PYPROJECT', workspace_root / "pyproject.toml"), \
+             patch('os.chdir'):
+            
+            # Mock sequence: uv version check, outdated check, uv add (fails), then resolution sequence
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # uv --version
+                MagicMock(returncode=0, stdout=mock_outdated_output),  # uv pip list --outdated
+                MagicMock(returncode=1, stderr=conflict_stderr, stdout=""),  # uv add (fails with conflict)
+                MagicMock(returncode=0, stdout=mock_outdated_output),  # get_latest_version for pydantic
+                # Resolution sequence
+                MagicMock(returncode=0),  # uv add common
+                MagicMock(returncode=0),  # uv add qluster-sdk
+                MagicMock(returncode=0),  # uv lock
+            ]
+            
+            os.chdir(workspace_root)
+            with patch('sys.argv', ['uvrepin', '--yes', '--only-groups', 'dev']):
+                exit_code = main()
+            
+            assert exit_code == 0
+            captured = capsys.readouterr()
+            assert "Auto-accepting workspace conflict resolution" in captured.out
+            assert "Workspace conflicts resolved successfully" in captured.out
+            
+            # Verify that the alignment calls were made
+            actual_calls = [call[0] for call in mock_run.call_args_list]
+            member_calls = [call for call in actual_calls if "add" in call and "--project" in call]
+            assert len(member_calls) == 2
+            # Both members should be aligned to latest pydantic version
+            assert any("common" in call and "pydantic==2.11.7" in call for call in member_calls)
+            assert any("qluster-sdk" in call and "pydantic==2.11.7" in call for call in member_calls)

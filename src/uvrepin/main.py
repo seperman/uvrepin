@@ -138,11 +138,19 @@ def parse_workspace_conflict(stderr: str) -> Optional[list[WorkspaceConflict]]:
     
     conflicts = []
     
+    # Normalize whitespace for easier pattern matching
+    normalized = re.sub(r'\s+', ' ', stderr)
+    
     # Pattern to match conflicts like:
     # Because common[dev] depends on flake8==7.2.0 and qluster-sdk[dev] depends on flake8==7.3.0
-    conflict_pattern = r"Because ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s]+) and ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s,]+)"
+    conflict_pattern1 = r"Because ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s]+) and ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s,]+)"
     
-    for match in re.finditer(conflict_pattern, stderr):
+    # Pattern to match conflicts like the new uv format:
+    # Because common depends on pydantic==2.11.7 and qluster-sdk[dev] depends on pydantic==2.11.5, we can conclude that common[dev] and qluster-sdk[dev] are incompatible.
+    conflict_pattern2 = r"Because ([a-zA-Z0-9_-]+) depends on ([^=]+)==([^\s,]+) and ([a-zA-Z0-9_-]+)\[([^\]]+)\] depends on ([^=]+)==([^\s,]+).*?([a-zA-Z0-9_-]+)\[(\w+)\] and ([a-zA-Z0-9_-]+)\[(\w+)\] are incompatible"
+    
+    # Try first pattern (original format)
+    for match in re.finditer(conflict_pattern1, normalized):
         member1, extra1, pkg1, ver1, member2, extra2, pkg2, ver2 = match.groups()
         
         # Only handle same extra name and same package
@@ -150,6 +158,22 @@ def parse_workspace_conflict(stderr: str) -> Optional[list[WorkspaceConflict]]:
             conflicts.append(WorkspaceConflict(
                 package_name=pkg1.strip(),
                 extra_name=extra1.strip(), 
+                conflicts={
+                    member1.strip(): ver1.strip(),
+                    member2.strip(): ver2.strip()
+                }
+            ))
+    
+    # Try second pattern (newer uv format)
+    for match in re.finditer(conflict_pattern2, normalized):
+        member1, pkg1, ver1, member2, extra2, pkg2, ver2, member1_extra, extra1, member2_extra, extra2_full = match.groups()
+        
+        # Verify the incompatible part matches our members and the extra names match
+        if (member1_extra == member1 and member2_extra == member2 and 
+            extra1 == extra2_full and pkg1 == pkg2):
+            conflicts.append(WorkspaceConflict(
+                package_name=pkg1.strip(),
+                extra_name=extra1.strip(),
                 conflicts={
                     member1.strip(): ver1.strip(),
                     member2.strip(): ver2.strip()
