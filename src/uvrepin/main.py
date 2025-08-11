@@ -13,7 +13,9 @@ Usage:
   python main.py --pre      # allow pre-releases
   python main.py --index https://pypi.org/simple   # repeatable
 """
-import argparse, pathlib, re, shlex, subprocess, sys
+import argparse, os, pathlib, re, shlex, subprocess, sys
+from dataclasses import dataclass
+from typing import Optional
 
 try:
     import tomllib  # Python 3.11+
@@ -21,6 +23,21 @@ except Exception:
     sys.stderr.write("Needs Python 3.11+ (tomllib).\n"); sys.exit(1)
 
 PYPROJECT = pathlib.Path("pyproject.toml")
+
+@dataclass
+class WorkspaceConflict:
+    """Represents a package version conflict across workspace members."""
+    package_name: str
+    extra_name: str
+    conflicts: dict[str, str]  # member_name -> version
+
+@dataclass 
+class ConflictResolution:
+    """Represents the resolution plan for workspace conflicts."""
+    extra_name: str
+    conflicts: list[WorkspaceConflict]
+    target_versions: dict[str, str]  # package_name -> target_version
+    affected_members: set[str]
 
 def die(msg: str, code: int = 1):
     sys.stderr.write(msg.rstrip()+"\n"); raise SystemExit(code)
@@ -98,12 +115,175 @@ def gather_direct(data: dict) -> tuple[dict[str|None, list[dict]], dict[str, boo
             is_optional[gname] = False
     return out, is_optional
 
+class UvRunner:
+    """Abstraction for running uv commands, making them easier to mock in tests."""
+    
+    def run(self, *args: str, capture=False, check=True):
+        return subprocess.run(args, text=True, capture_output=capture, check=check)
+
+# Global instance for ease of use
+uv_runner = UvRunner()
+
 def run(*args: str, capture=False, check=True):
-    return subprocess.run(args, text=True, capture_output=capture, check=check)
+    return uv_runner.run(*args, capture=capture, check=check)
 
 def ensure_uv():
     try: run("uv", "--version", check=True)
     except Exception: die("uv not found on PATH.")
+
+def parse_workspace_conflict(stderr: str) -> Optional[list[WorkspaceConflict]]:
+    """Parse workspace conflict from uv stderr output."""
+    if "No solution found when resolving dependencies" not in stderr:
+        return None
+    
+    conflicts = []
+    
+    # Pattern to match conflicts like:
+    # Because common[dev] depends on flake8==7.2.0 and qluster-sdk[dev] depends on flake8==7.3.0
+    conflict_pattern = r"Because ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s]+) and ([^[]+)\[([^\]]+)\] depends on ([^=]+)==([^\s,]+)"
+    
+    for match in re.finditer(conflict_pattern, stderr):
+        member1, extra1, pkg1, ver1, member2, extra2, pkg2, ver2 = match.groups()
+        
+        # Only handle same extra name and same package
+        if extra1 == extra2 and pkg1 == pkg2:
+            conflicts.append(WorkspaceConflict(
+                package_name=pkg1.strip(),
+                extra_name=extra1.strip(), 
+                conflicts={
+                    member1.strip(): ver1.strip(),
+                    member2.strip(): ver2.strip()
+                }
+            ))
+    
+    return conflicts
+
+def get_latest_version(package_name: str, indexes: list[str], allow_pre: bool) -> str:
+    """Get the latest version of a package using uv pip list --outdated approach."""
+    # For now, use the same mechanism as the main uvrepin logic
+    # This is a simplified version - in practice we'd want to reuse existing logic
+    try:
+        proc = run("uv", "pip", "list", "--outdated", capture=True)
+        latest_map = parse_outdated_table(proc.stdout)
+        return latest_map.get(pep503(package_name), "unknown")
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+def determine_target_versions(conflicts: list[WorkspaceConflict], policy: str = "latest") -> dict[str, str]:
+    """Determine target versions for conflicting packages."""
+    target_versions = {}
+    
+    for conflict in conflicts:
+        if policy == "latest":
+            # Use the latest available version
+            latest = get_latest_version(conflict.package_name, [], False)
+            if latest != "unknown":
+                target_versions[conflict.package_name] = latest
+            else:
+                # Fallback to max of existing versions
+                versions = list(conflict.conflicts.values())
+                target_versions[conflict.package_name] = max(versions)
+        elif policy == "max":
+            # Use the highest version among existing pins
+            versions = list(conflict.conflicts.values()) 
+            target_versions[conflict.package_name] = max(versions)
+        else:
+            raise ValueError(f"Unknown policy: {policy}")
+    
+    return target_versions
+
+def is_ci_environment() -> bool:
+    """Check if running in CI environment."""
+    return os.getenv("CI", "").lower() in ("true", "1", "yes")
+
+def prompt_user_for_conflict_resolution(conflicts: list[WorkspaceConflict], target_versions: dict[str, str]) -> bool:
+    """Prompt user to resolve workspace conflicts. Returns True if user accepts."""
+    if not conflicts:
+        return False
+    
+    extra_name = conflicts[0].extra_name
+    member_count = len(set().union(*[c.conflicts.keys() for c in conflicts]))
+    
+    print(f"\nConflicts detected in extra \"{extra_name}\" across {member_count} members:")
+    
+    for conflict in conflicts:
+        member_versions = []
+        for member, version in conflict.conflicts.items():
+            member_versions.append(f"{member}(=={version})")
+        conflict_str = " ↔ ".join(member_versions)
+        target_version = target_versions.get(conflict.package_name, "unknown")
+        print(f"  {conflict.package_name}: {conflict_str} → {target_version}")
+    
+    print(f"Align all pyproject.toml files to target versions (latest) and retry lock? [y/N] ", end="")
+    response = input().strip().lower()
+    return response in ('y', 'yes')
+
+def show_manual_resolution_help(conflicts: list[WorkspaceConflict]) -> None:
+    """Show manual resolution commands when user declines auto-resolution."""
+    print("\nTo manually resolve these conflicts, align the versions in each member's pyproject.toml:")
+    
+    extra_name = conflicts[0].extra_name if conflicts else "dev"
+    affected_members = set().union(*[c.conflicts.keys() for c in conflicts])
+    
+    print(f"\nSuggested commands to align extra '{extra_name}':")
+    for member in sorted(affected_members):
+        for conflict in conflicts:
+            if member in conflict.conflicts:
+                print(f"  uv add --project {member} --optional {extra_name} {conflict.package_name}==<target_version>")
+    
+    print("\nThen run: uv lock")
+
+def align_workspace_members(resolution: ConflictResolution, sync: bool, indexes: list[str], allow_pre: bool) -> bool:
+    """Align workspace members to resolve conflicts. Returns True if successful."""
+    print("\nAligning workspace members...")
+    
+    # Stage changes in each affected member
+    for member in sorted(resolution.affected_members):
+        member_specs = []
+        for conflict in resolution.conflicts:
+            if member in conflict.conflicts:
+                target_version = resolution.target_versions[conflict.package_name]
+                spec = f"{conflict.package_name}=={target_version}"
+                member_specs.append(spec)
+        
+        if member_specs:
+            cmd = ["uv", "add", "--project", member, "--no-sync", "--frozen", "--optional", resolution.extra_name] + member_specs
+            print("Running:", " ".join(shlex.quote(x) for x in cmd))
+            try:
+                result = run(*cmd)
+                if result.returncode != 0:
+                    print(f"Failed to stage changes for member '{member}'")
+                    return False
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to stage changes for member '{member}': {e}")
+                return False
+    
+    # Run uv lock
+    print("Running: uv lock")
+    try:
+        result = run("uv", "lock")
+        if result.returncode != 0:
+            print("uv lock failed after alignment. Files have been modified.")
+            return False
+    except subprocess.CalledProcessError as e:
+        print(f"uv lock failed after alignment: {e}")
+        print("Files have been modified but lock failed.")
+        return False
+    
+    # Optionally sync
+    if sync:
+        print(f"Running: uv sync --optional {resolution.extra_name}")
+        try:
+            result = run("uv", "sync", "--optional", resolution.extra_name)
+            if result.returncode != 0:
+                print(f"uv sync failed but lock succeeded. Environment may be inconsistent.")
+                return False
+        except subprocess.CalledProcessError as e:
+            print(f"uv sync failed: {e}")
+            print("Lock succeeded but sync failed. Environment may be inconsistent.")
+            return False
+    
+    return True
 
 def parse_outdated_table(text: str) -> dict[str, str]:
     """Parse `uv pip list --outdated` into {normalized_name: latest_version}."""
@@ -143,6 +323,7 @@ def main():
     ap.add_argument("--only-groups", default="", help="Comma list; use 'main' for [project.dependencies].")
     ap.add_argument("--pre", action="store_true", help="Include pre-releases.")
     ap.add_argument("--index", action="append", default=[], help="Additional index URL(s).")
+    ap.add_argument("--yes", "-y", action="store_true", help="Auto-accept workspace conflict resolution prompts.")
     args = ap.parse_args()
 
     ensure_uv()
@@ -209,8 +390,54 @@ def main():
             reqs.append(spec)
         cmd = base + reqs
         print("Running:", " ".join(shlex.quote(x) for x in cmd))
-        res = subprocess.run(cmd)
-        rc = rc or res.returncode
+        try:
+            res = run(*cmd, capture=True)
+            rc = rc or res.returncode
+            
+            # Check for workspace conflicts on failure
+            if res.returncode != 0 and res.stderr:
+                conflicts = parse_workspace_conflict(res.stderr)
+                if conflicts and len(conflicts) > 0:
+                    # Handle workspace conflicts
+                    target_versions = determine_target_versions(conflicts, "latest")
+                    affected_members = set().union(*[c.conflicts.keys() for c in conflicts])
+                    
+                    resolution = ConflictResolution(
+                        extra_name=conflicts[0].extra_name,
+                        conflicts=conflicts,
+                        target_versions=target_versions,
+                        affected_members=affected_members
+                    )
+                    
+                    # Check if we should auto-accept or prompt
+                    auto_accept = args.yes or is_ci_environment()
+                    
+                    if auto_accept:
+                        print(f"\nAuto-accepting workspace conflict resolution for extra '{resolution.extra_name}'...")
+                        if align_workspace_members(resolution, args.sync, args.index, args.pre):
+                            print("\nWorkspace conflicts resolved successfully.")
+                            return 0
+                        else:
+                            die("Failed to resolve workspace conflicts.", 1)
+                    else:
+                        # Interactive prompt
+                        if prompt_user_for_conflict_resolution(conflicts, target_versions):
+                            if align_workspace_members(resolution, args.sync, args.index, args.pre):
+                                print("\nWorkspace conflicts resolved successfully.")
+                                return 0
+                            else:
+                                die("Failed to resolve workspace conflicts.", 1)
+                        else:
+                            show_manual_resolution_help(conflicts)
+                            return 0
+                    
+                # If not a workspace conflict, show the original error
+                sys.stderr.write(res.stderr)
+            
+        except subprocess.CalledProcessError as e:
+            rc = rc or e.returncode
+            if e.stderr:
+                sys.stderr.write(e.stderr)
 
     if rc == 0:
         print("\nDone. pyproject.toml updated{}."

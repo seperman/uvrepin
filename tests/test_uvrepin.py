@@ -231,8 +231,8 @@ requests   2.28.0     2.28.1     wheel"""
                 exit_code = main()
                 
             assert exit_code is None or exit_code == 0
-            # Verify uv add was called with the right arguments
-            mock_run.assert_any_call(['uv', 'add', '--no-sync', 'requests==2.28.1'])
+            # Verify uv add was called with the right arguments  
+            mock_run.assert_any_call(('uv', 'add', '--no-sync', 'requests==2.28.1'), text=True, capture_output=True, check=True)
 
     def test_only_groups_filter(self, tmp_path, capsys):
         """Test --only-groups filter"""
@@ -348,7 +348,7 @@ pytest     7.3.0      7.4.0      wheel"""
                 
             assert exit_code == 0
             # Verify uv add was called with --optional flag
-            mock_run.assert_any_call(['uv', 'add', '--no-sync', '--optional', 'dev', 'pytest==7.4.0'])
+            mock_run.assert_any_call(('uv', 'add', '--no-sync', '--optional', 'dev', 'pytest==7.4.0'), text=True, capture_output=True, check=True)
 
 
 class TestCLIIntegration:
