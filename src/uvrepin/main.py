@@ -13,9 +13,10 @@ Usage:
   python main.py --pre      # allow pre-releases
   python main.py --index https://pypi.org/simple   # repeatable
 """
-import argparse, os, pathlib, re, shlex, subprocess, sys
+import argparse, json, os, pathlib, re, shlex, subprocess, sys, urllib.request
 from dataclasses import dataclass
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import tomllib  # Python 3.11+
@@ -183,15 +184,9 @@ def parse_workspace_conflict(stderr: str) -> Optional[list[WorkspaceConflict]]:
     return conflicts
 
 def get_latest_version(package_name: str, indexes: list[str], allow_pre: bool) -> str:
-    """Get the latest version of a package using uv pip list --outdated approach."""
-    # For now, use the same mechanism as the main uvrepin logic
-    # This is a simplified version - in practice we'd want to reuse existing logic
-    try:
-        proc = run("uv", "pip", "list", "--outdated", capture=True)
-        latest_map = parse_outdated_table(proc.stdout)
-        return latest_map.get(pep503(package_name), "unknown")
-    except subprocess.CalledProcessError:
-        return "unknown"
+    """Get the latest version of a package by querying PyPI directly."""
+    version = query_pypi_latest(package_name, allow_pre)
+    return version if version else "unknown"
 
 def determine_target_versions(conflicts: list[WorkspaceConflict], policy: str = "latest") -> dict[str, str]:
     """Determine target versions for conflicting packages."""
@@ -257,56 +252,155 @@ def show_manual_resolution_help(conflicts: list[WorkspaceConflict]) -> None:
     
     print("\nThen run: uv lock")
 
+def find_package_location_in_member(member: str, package_name: str) -> str | None:
+    """Find where a package is defined in a workspace member's pyproject.toml.
+
+    Returns:
+        None if package is in main dependencies
+        Group name (str) if package is in optional-dependencies or dependency-groups
+    """
+    member_pyproject = pathlib.Path(member) / "pyproject.toml"
+    if not member_pyproject.exists():
+        return None
+
+    try:
+        with member_pyproject.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+
+    norm_name = pep503(package_name)
+    proj = data.get("project", {})
+
+    # Check main dependencies first
+    main_deps = proj.get("dependencies", []) or []
+    for dep in main_deps:
+        parsed = parse_req(dep)
+        if parsed and parsed[0] != "SKIP" and pep503(parsed[0]) == norm_name:
+            return None  # Found in main deps
+
+    # Check optional-dependencies
+    optional_deps = proj.get("optional-dependencies", {}) or {}
+    for group_name, deps in optional_deps.items():
+        if not isinstance(deps, list):
+            continue
+        for dep in deps:
+            parsed = parse_req(dep)
+            if parsed and parsed[0] != "SKIP" and pep503(parsed[0]) == norm_name:
+                return group_name  # Found in optional group
+
+    # Check dependency-groups (PEP 735)
+    dep_groups = data.get("dependency-groups", {}) or {}
+    for group_name, deps in dep_groups.items():
+        if not isinstance(deps, list):
+            continue
+        for dep in deps:
+            parsed = parse_req(dep)
+            if parsed and parsed[0] != "SKIP" and pep503(parsed[0]) == norm_name:
+                return f"group:{group_name}"  # Found in dependency group
+
+    return None  # Not found, assume main
+
+
 def align_workspace_members(resolution: ConflictResolution, sync: bool, indexes: list[str], allow_pre: bool) -> bool:
     """Align workspace members to resolve conflicts. Returns True if successful."""
     print("\nAligning workspace members...")
-    
+
     # Stage changes in each affected member
     for member in sorted(resolution.affected_members):
-        member_specs = []
+        # Group specs by their location (main, optional, or dependency-group)
+        main_specs = []
+        optional_specs: dict[str, list[str]] = {}  # group_name -> specs
+        group_specs: dict[str, list[str]] = {}  # group_name -> specs
+
         for conflict in resolution.conflicts:
             if member in conflict.conflicts:
                 target_version = resolution.target_versions[conflict.package_name]
                 spec = f"{conflict.package_name}=={target_version}"
-                member_specs.append(spec)
-        
-        if member_specs:
-            cmd = ["uv", "add", "--project", member, "--no-sync", "--optional", resolution.extra_name] + member_specs
+
+                location = find_package_location_in_member(member, conflict.package_name)
+                if location is None:
+                    main_specs.append(spec)
+                elif location.startswith("group:"):
+                    group_name = location[6:]
+                    group_specs.setdefault(group_name, []).append(spec)
+                else:
+                    optional_specs.setdefault(location, []).append(spec)
+
+        # Run uv add for main dependencies (use --frozen to skip resolution until all members updated)
+        if main_specs:
+            cmd = ["uv", "add", "--project", member, "--frozen"] + main_specs
             print("Running:", " ".join(shlex.quote(x) for x in cmd))
             try:
-                result = run(*cmd)
+                result = run(*cmd, capture=True, check=False)
                 if result.returncode != 0:
-                    print(f"Failed to stage changes for member '{member}'")
+                    print(f"Failed to stage main deps for member '{member}'")
+                    if result.stderr:
+                        sys.stderr.write(result.stderr)
                     return False
             except subprocess.CalledProcessError as e:
-                print(f"Failed to stage changes for member '{member}': {e}")
+                print(f"Failed to stage main deps for member '{member}': {e}")
                 return False
-    
+
+        # Run uv add for optional dependencies
+        for opt_group, specs in optional_specs.items():
+            cmd = ["uv", "add", "--project", member, "--frozen", "--optional", opt_group] + specs
+            print("Running:", " ".join(shlex.quote(x) for x in cmd))
+            try:
+                result = run(*cmd, capture=True, check=False)
+                if result.returncode != 0:
+                    print(f"Failed to stage optional deps for member '{member}'")
+                    if result.stderr:
+                        sys.stderr.write(result.stderr)
+                    return False
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to stage optional deps for member '{member}': {e}")
+                return False
+
+        # Run uv add for dependency groups
+        for dep_group, specs in group_specs.items():
+            cmd = ["uv", "add", "--project", member, "--frozen", "--group", dep_group] + specs
+            print("Running:", " ".join(shlex.quote(x) for x in cmd))
+            try:
+                result = run(*cmd, capture=True, check=False)
+                if result.returncode != 0:
+                    print(f"Failed to stage group deps for member '{member}'")
+                    if result.stderr:
+                        sys.stderr.write(result.stderr)
+                    return False
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to stage group deps for member '{member}': {e}")
+                return False
+
     # Run uv lock
     print("Running: uv lock")
     try:
-        result = run("uv", "lock")
+        result = run("uv", "lock", capture=True, check=False)
         if result.returncode != 0:
             print("uv lock failed after alignment. Files have been modified.")
+            if result.stderr:
+                sys.stderr.write(result.stderr)
             return False
     except subprocess.CalledProcessError as e:
         print(f"uv lock failed after alignment: {e}")
         print("Files have been modified but lock failed.")
         return False
-    
+
     # Optionally sync
     if sync:
-        print(f"Running: uv sync --optional {resolution.extra_name}")
+        print("Running: uv sync")
         try:
-            result = run("uv", "sync", "--optional", resolution.extra_name)
+            result = run("uv", "sync", capture=True, check=False)
             if result.returncode != 0:
-                print(f"uv sync failed but lock succeeded. Environment may be inconsistent.")
+                print("uv sync failed but lock succeeded. Environment may be inconsistent.")
+                if result.stderr:
+                    sys.stderr.write(result.stderr)
                 return False
         except subprocess.CalledProcessError as e:
             print(f"uv sync failed: {e}")
             print("Lock succeeded but sync failed. Environment may be inconsistent.")
             return False
-    
+
     return True
 
 def parse_outdated_table(text: str) -> dict[str, str]:
@@ -328,9 +422,78 @@ def parse_outdated_table(text: str) -> dict[str, str]:
         latest[pep503(name)] = latest_ver
     return latest
 
-def build_uv_add_base(group: str|None, sync: bool, allow_pre: bool, indexes: list[str], is_optional: bool = False) -> list[str]:
+
+def query_pypi_latest(package_name: str, allow_pre: bool = False) -> str | None:
+    """Query PyPI API directly to get the latest version of a package.
+
+    Returns the latest stable version, or latest pre-release if allow_pre is True.
+    Returns None if the package cannot be found or there's an error.
+    """
+    url = f"https://pypi.org/pypi/{package_name}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            if allow_pre:
+                # Return the absolute latest version
+                return data["info"]["version"]
+            else:
+                # Filter out pre-releases and return latest stable
+                latest = data["info"]["version"]
+                releases = data.get("releases", {})
+                # Check if latest is a pre-release
+                pre_patterns = re.compile(r"(a|b|rc|alpha|beta|dev|pre)\d*", re.IGNORECASE)
+                if pre_patterns.search(latest):
+                    # Find the latest stable version
+                    stable_versions = []
+                    for ver in releases.keys():
+                        if not pre_patterns.search(ver) and releases[ver]:  # has files
+                            stable_versions.append(ver)
+                    if stable_versions:
+                        # Sort by version (simple string sort works for most cases)
+                        # For more accurate sorting, would need packaging.version
+                        try:
+                            from packaging.version import Version
+                            stable_versions.sort(key=Version, reverse=True)
+                        except ImportError:
+                            stable_versions.sort(reverse=True)
+                        return stable_versions[0]
+                return latest
+    except Exception:
+        return None
+
+
+def query_pypi_batch(package_names: list[str], allow_pre: bool = False, max_workers: int = 10) -> dict[str, str]:
+    """Query PyPI for latest versions of multiple packages in parallel.
+
+    Returns a dict mapping normalized package names to their latest versions.
+    """
+    latest_map = {}
+
+    def fetch_one(name: str) -> tuple[str, str | None]:
+        return (pep503(name), query_pypi_latest(name, allow_pre))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_one, name): name for name in package_names}
+        for future in as_completed(futures):
+            try:
+                norm_name, version = future.result()
+                if version:
+                    latest_map[norm_name] = version
+            except Exception:
+                pass  # Skip packages that fail
+
+    return latest_map
+
+def build_uv_add_base(group: str|None, frozen: bool, allow_pre: bool, indexes: list[str], is_optional: bool = False) -> list[str]:
+    """Build the base uv add command.
+
+    Args:
+        frozen: If True, use --frozen to skip resolution (for workspace compatibility).
+                The caller must run `uv lock` after all updates.
+    """
     args = ["uv", "add"]
-    if not sync: args.append("--no-sync")
+    if frozen:
+        args.append("--frozen")
     if group is not None:
         if is_optional:
             args += ["--optional", group]
@@ -363,12 +526,24 @@ def main():
         if not groups:
             print("No matching groups after --only-groups."); return 0
 
-    # Ask uv what's outdated to learn the "latest" versions.
-    try:
-        proc = run("uv", "pip", "list", "--outdated", capture=True)
-        latest_map = parse_outdated_table(proc.stdout)
-    except subprocess.CalledProcessError as e:
-        die(f"Failed to run 'uv pip list --outdated':\n{e.stderr or e}", 2)
+    # Collect all pinned package names to query PyPI
+    pinned_packages = set()
+    for gname, deps in groups.items():
+        for d in deps:
+            if d.get("pinned"):
+                pinned_packages.add(d["name"])
+
+    if not pinned_packages:
+        print("No pinned dependencies (==version) found. Nothing to update.")
+        return 0
+
+    # Query PyPI directly to get latest versions (works even if packages aren't installed)
+    print(f"Querying PyPI for latest versions of {len(pinned_packages)} packages...")
+    latest_map = query_pypi_batch(list(pinned_packages), allow_pre=args.pre)
+
+    if not latest_map:
+        print("Failed to query PyPI for any packages. Check your network connection.")
+        return 1
 
     # Build plan: only deps that are pinned (==) and have a newer latest known.
     plan = []  # (group, dep_dict, latest_ver)
@@ -382,8 +557,7 @@ def main():
     # Dry-run output
     if args.dry_run:
         if not plan:
-            print("Dry run: nothing to update (no outdated direct deps detected).\n"
-                  "Tip: if some groups aren't installed (e.g. dev), run `uv sync --group <name>` and retry.")
+            print("Dry run: all pinned dependencies are already at their latest versions.")
             return 0
         print("\nDry run — would update these direct dependencies:\n")
         print("GROUP".ljust(12), "PACKAGE".ljust(38), "FROM".ljust(18), "TO")
@@ -397,16 +571,18 @@ def main():
         return 0
 
     if not plan:
-        print("All direct dependencies appear up-to-date (based on installed groups). Nothing to do.")
+        print("All pinned dependencies are already at their latest versions. Nothing to do.")
         return 0
 
-    # Execute per-group with explicit ==version pins (works on uv 0.7.8).
+    # Execute per-group with explicit ==version pins.
+    # Use --frozen to skip resolution during updates (important for workspaces).
+    # We'll run uv lock once at the end after all pyproject.toml files are updated.
     rc = 0
     for gname in list(groups.keys()):
         to_update = [(d, latest) for (g, d, latest) in plan if g == gname]
         if not to_update: continue
         is_opt = is_optional_map.get(gname, False) if gname is not None else False
-        base = build_uv_add_base(gname, sync=args.sync, allow_pre=args.pre, indexes=args.index, is_optional=is_opt)
+        base = build_uv_add_base(gname, frozen=True, allow_pre=args.pre, indexes=args.index, is_optional=is_opt)
         reqs = []
         for d, latest in to_update:
             spec = d["name"] + d["extras"] + f"=={latest}"
@@ -416,59 +592,50 @@ def main():
         print("Running:", " ".join(shlex.quote(x) for x in cmd))
         try:
             res = run(*cmd, capture=True, check=False)
-            rc = rc or res.returncode
-            
-            # Check for workspace conflicts on failure
-            if res.returncode != 0 and res.stderr:
-                conflicts = parse_workspace_conflict(res.stderr)
-                if conflicts and len(conflicts) > 0:
-                    # Handle workspace conflicts
-                    target_versions = determine_target_versions(conflicts, "latest")
-                    affected_members = set().union(*[c.conflicts.keys() for c in conflicts])
-                    
-                    resolution = ConflictResolution(
-                        extra_name=conflicts[0].extra_name,
-                        conflicts=conflicts,
-                        target_versions=target_versions,
-                        affected_members=affected_members
-                    )
-                    
-                    # Check if we should auto-accept or prompt
-                    auto_accept = args.yes or is_ci_environment()
-                    
-                    if auto_accept:
-                        print(f"\nAuto-accepting workspace conflict resolution for extra '{resolution.extra_name}'...")
-                        if align_workspace_members(resolution, args.sync, args.index, args.pre):
-                            print("\nWorkspace conflicts resolved successfully.")
-                            return 0
-                        else:
-                            die("Failed to resolve workspace conflicts.", 1)
-                    else:
-                        # Interactive prompt
-                        if prompt_user_for_conflict_resolution(conflicts, target_versions):
-                            if align_workspace_members(resolution, args.sync, args.index, args.pre):
-                                print("\nWorkspace conflicts resolved successfully.")
-                                return 0
-                            else:
-                                die("Failed to resolve workspace conflicts.", 1)
-                        else:
-                            show_manual_resolution_help(conflicts)
-                            return 0
-                    
-                # If not a workspace conflict, show the original error
-                sys.stderr.write(res.stderr)
+            if res.returncode != 0:
+                print(f"Failed to update dependencies")
+                if res.stderr:
+                    sys.stderr.write(res.stderr)
+                rc = 1
             
         except subprocess.CalledProcessError as e:
             rc = rc or e.returncode
             if e.stderr:
                 sys.stderr.write(e.stderr)
 
-    if rc == 0:
-        print("\nDone. pyproject.toml updated{}."
-              .format(" and environment synced" if args.sync else " (environment unchanged)"))
-        return 0
-    else:
-        die("One or more uv commands failed. See output above.", rc)
+    if rc != 0:
+        die("One or more uv add commands failed. See output above.", rc)
+
+    # Run uv lock to resolve dependencies after all pyproject.toml files updated
+    print("Running: uv lock")
+    try:
+        res = run("uv", "lock", capture=True, check=False)
+        if res.returncode != 0:
+            print("uv lock failed. pyproject.toml files have been updated but lock failed.")
+            if res.stderr:
+                sys.stderr.write(res.stderr)
+            return 1
+    except subprocess.CalledProcessError as e:
+        print(f"uv lock failed: {e}")
+        return 1
+
+    # Optionally sync
+    if args.sync:
+        print("Running: uv sync")
+        try:
+            res = run("uv", "sync", capture=True, check=False)
+            if res.returncode != 0:
+                print("uv sync failed. Lock succeeded but environment not synced.")
+                if res.stderr:
+                    sys.stderr.write(res.stderr)
+                return 1
+        except subprocess.CalledProcessError as e:
+            print(f"uv sync failed: {e}")
+            return 1
+
+    print("\nDone. pyproject.toml updated{}."
+          .format(" and environment synced" if args.sync else " (run `uv sync` to update environment)"))
+    return 0
 
 if __name__ == "__main__":
     main()
